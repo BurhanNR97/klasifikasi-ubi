@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">Klasifikasi Ubi Jalar</string>
+    <string-array name="jenis_sampel">
+        <item>Ubi Ungu</item>
+        <item>Ubi Jingga</item>
+        <item>Ubi Putih</item>
+    </string-array>
+</resources>
