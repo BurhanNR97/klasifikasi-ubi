@@ -285,11 +285,10 @@ public class KlasifikasiActivity extends AppCompatActivity {
                 // fallback flex
                 String tf = o.optString("tflite_flex", "");
                 if (tf != null && !tf.isEmpty()) return tf;
-                // kalau terpaksa, biarkan non-tflite (tidak dipakai di Android)
                 return null;
             };
 
-            // ======== 1) MODE UMUM (tanpa suffix fold) ========
+            // ======== 1) MODE UMUM ========
             String uColor = pickTflite.apply(artifacts.optJSONObject("color"));
             String uTex   = pickTflite.apply(artifacts.optJSONObject("texture"));
             String uFused = pickTflite.apply(artifacts.optJSONObject("fused"));
@@ -307,21 +306,18 @@ public class KlasifikasiActivity extends AppCompatActivity {
             }
 
             // ===== Unduh & buka interpreter =====
-            // COLOR
             if (uColor != null && uColor.endsWith(".tflite")) {
                 try {
                     downloadIfNeeded(fileUrl(uColor), fColor);
                     itColor = openInterpreter(fColor);
                     modelColorReady = true; any = true;
                 } catch (Exception e) {
-                    // coba _flex kalau ada
                     String alt = uColor.replace(".tflite", "_flex.tflite");
                     try { downloadIfNeeded(fileUrl(alt), fColor); itColor = openInterpreter(fColor); modelColorReady = true; any = true; }
                     catch (Exception ex) { reportModelError("color", e, fColor); }
                 }
             }
 
-            // TEXTURE
             if (uTex != null && uTex.endsWith(".tflite")) {
                 try {
                     downloadIfNeeded(fileUrl(uTex), fTexture);
@@ -334,7 +330,6 @@ public class KlasifikasiActivity extends AppCompatActivity {
                 }
             }
 
-            // FUSED
             if (uFused != null && uFused.endsWith(".tflite")) {
                 try {
                     downloadIfNeeded(fileUrl(uFused), fFused);
@@ -353,7 +348,6 @@ public class KlasifikasiActivity extends AppCompatActivity {
             return false;
         }
     }
-
 
     private boolean ensureModelsReadyFallback(File dir) {
         try {
@@ -767,6 +761,7 @@ public class KlasifikasiActivity extends AppCompatActivity {
         int pad = (int) (16 * getResources().getDisplayMetrics().density);
         root.setPadding(pad, pad, pad, pad);
 
+        // ✅ pakai TextAppearance Material 3 (bukan Typeface)
         android.widget.TextView t1 = new android.widget.TextView(this);
         TextViewCompat.setTextAppearance(t1, android.graphics.Typeface.BOLD);
         t1.setText("Langkah Gambar");
@@ -889,7 +884,7 @@ public class KlasifikasiActivity extends AppCompatActivity {
     private int[][] bitmapToGray2D(Bitmap b){
         int w=b.getWidth(), h=b.getHeight();
         int[] px = new int[w*h];
-        b.getPixels(px, 0, w, 0, 0, w, h);
+        b.getPixels(px, 0, W, 0, 0, W, H);
         int[][] out = new int[h][w];
         int i=0;
         for(int y=0;y<h;y++){
@@ -976,12 +971,12 @@ public class KlasifikasiActivity extends AppCompatActivity {
 
                 // field file
                 InputStream is = getContentResolver().openInputStream(imageUri);
-                byte[] img = readBytes(is); // helper di file ini
+                byte[] img = readBytes(is);
                 String mime = getContentResolver().getType(imageUri);
                 if (mime == null || mime.trim().isEmpty()) mime = "image/jpeg";
                 writeFileField(os, boundary, "image", "input.jpg", mime, img);
 
-                // tutup multipart
+                // akhir multipart
                 os.writeBytes("--" + boundary + "--\r\n");
                 os.flush();
             }
