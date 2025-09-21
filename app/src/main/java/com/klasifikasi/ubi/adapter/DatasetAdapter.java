@@ -18,9 +18,13 @@ import java.util.List;
 
 public class DatasetAdapter extends RecyclerView.Adapter<DatasetAdapter.VH> {
 
+    @FunctionalInterface
     public interface Listener {
+        // Satu-satunya method abstrak → bisa pakai lambda
+        void onDownload(DatasetItem d);
+
+        // Opsional
         default void onClick(DatasetItem d) {}
-        default void onDownload(DatasetItem d) {}
     }
 
     private final List<DatasetItem> data = new ArrayList<>();
