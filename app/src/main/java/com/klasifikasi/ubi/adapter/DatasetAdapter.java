@@ -1,14 +1,20 @@
 package com.klasifikasi.ubi.adapter;
 
 import android.annotation.SuppressLint;
-import android.view.*;
-import android.widget.*;
+import android.view.LayoutInflater;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.ImageButton;
+import android.widget.TextView;
+
 import androidx.annotation.NonNull;
 import androidx.recyclerview.widget.RecyclerView;
+
 import com.klasifikasi.ubi.R;
 import com.klasifikasi.ubi.model.DatasetItem;
-import com.klasifikasi.ubi.utils.UrlUtil;
-import java.util.*;
+
+import java.util.ArrayList;
+import java.util.List;
 
 public class DatasetAdapter extends RecyclerView.Adapter<DatasetAdapter.VH> {
 
@@ -38,8 +44,13 @@ public class DatasetAdapter extends RecyclerView.Adapter<DatasetAdapter.VH> {
     @Override
     public void onBindViewHolder(@NonNull VH h, int pos) {
         DatasetItem d = data.get(pos);
-        h.tvNama.setText("("+d.id+") " + d.nama);
-        h.tvTanggal.setText(d.tanggal);
+
+        String nama = d.nama != null ? d.nama : "(tanpa nama)";
+        String tanggal = d.tanggal != null ? d.tanggal : "";
+
+        h.tvNama.setText("(" + d.id + ") " + nama);
+        h.tvTanggal.setText(tanggal);
+
         h.btnDownload.setOnClickListener(v -> listener.onDownload(d));
         h.itemView.setOnClickListener(v -> listener.onClick(d));
     }

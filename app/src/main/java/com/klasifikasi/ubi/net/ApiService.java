@@ -1,4 +1,3 @@
-// com/klasifikasi/ubi/net/ApiService.java
 package com.klasifikasi.ubi.net;
 
 import com.klasifikasi.ubi.model.DatasetItem;
@@ -9,6 +8,8 @@ import com.klasifikasi.ubi.model.LoginRequest;
 import com.klasifikasi.ubi.model.LoginResponse;
 import com.klasifikasi.ubi.model.Sampel;
 import com.klasifikasi.ubi.model.TrainStatus;
+import com.klasifikasi.ubi.model.StartTrainRequest;
+import com.klasifikasi.ubi.model.ArtifactsResponse;
 
 import java.util.List;
 
@@ -28,7 +29,6 @@ import retrofit2.http.Query;
 
 public interface ApiService {
 
-    // (opsional) login
     @Headers("Accept: application/json")
     @POST("login")
     Call<LoginResponse> login(@Body LoginRequest body);
@@ -51,7 +51,7 @@ public interface ApiService {
     @POST("sampel")
     Call<Sampel> createSampelBase64(
             @Field("jenis") String jenis,
-            @Field("foto") String fotoBase64 // boleh null
+            @Field("foto") String fotoBase64
     );
 
     @Headers("Accept: application/json")
@@ -59,9 +59,9 @@ public interface ApiService {
     @POST("sampel/{id}")
     Call<Sampel> updateSampelBase64(
             @Path("id") int id,
-            @Field("_method") String method, // kirim "PUT"
+            @Field("_method") String method,
             @Field("jenis") String jenis,
-            @Field("foto") String fotoBase64 // boleh null
+            @Field("foto") String fotoBase64
     );
 
     @Headers("Accept: application/json")
@@ -69,7 +69,7 @@ public interface ApiService {
     @POST("sampel/{id}")
     Call<Void> deleteSampelCompat(
             @Path("id") int id,
-            @Field("_method") String method // kirim "DELETE"
+            @Field("_method") String method
     );
 
     // ===== Dashboard / jumlah =====
@@ -93,11 +93,16 @@ public interface ApiService {
     // ===== Training (mulai & status) =====
     @Headers("Accept: application/json")
     @POST("dataset/{id}/train")
-    Call<TrainStatus> startTrain(@Path("id") int id);
+    Call<TrainStatus> startTrain(@Path("id") int id, @Body StartTrainRequest body);
 
     @Headers("Accept: application/json")
     @GET("dataset/{id}/train")
     Call<TrainStatus> getTrainStatus(@Path("id") int id);
+
+    // Opsional: ambil daftar artifacts saja (models+images)
+    @Headers("Accept: application/json")
+    @GET("dataset/{id}/artifacts")
+    Call<ArtifactsResponse> getArtifacts(@Path("id") int id);
 
     // ===== Ping (debug nginx/laravel) =====
     @Headers("Accept: application/json")
@@ -114,21 +119,19 @@ public interface ApiService {
             @Part("warna") RequestBody warna,
             @Part("tekstur") RequestBody tekstur,
             @Part("gabungan") RequestBody gabungan,
-            @Part("tanggal") RequestBody tanggal,          // "yyyy-MM-dd HH:mm:ss"
-            @Part MultipartBody.Part image                  // file foto
-            // (opsional) @Part("id_user") RequestBody idUser
+            @Part("tanggal") RequestBody tanggal,
+            @Part MultipartBody.Part image
     );
 
     @Headers("Accept: application/json")
     @GET("hasil")
     Call<List<Hasil>> listHasil(@Query("search") String search);
 
-    // Jika backend pakai metode kompatibel seperti Sampel (POST + _method=DELETE)
     @Headers("Accept: application/json")
     @FormUrlEncoded
     @POST("hasil/{id}")
     Call<Void> deleteHasilCompat(
             @Path("id") long id,
-            @Field("_method") String method  // kirim "DELETE"
+            @Field("_method") String method
     );
 }

@@ -1,4 +1,3 @@
-// com/klasifikasi/ubi/UI/DatasetList.java
 package com.klasifikasi.ubi.UI;
 
 import android.annotation.SuppressLint;
@@ -24,15 +23,24 @@ import com.klasifikasi.ubi.R;
 import com.klasifikasi.ubi.adapter.DatasetAdapter;
 import com.klasifikasi.ubi.model.DatasetItem;
 import com.klasifikasi.ubi.model.Sampel;
+import com.klasifikasi.ubi.model.StartTrainRequest;
 import com.klasifikasi.ubi.model.TrainStatus;
 import com.klasifikasi.ubi.net.ApiService;
 import com.klasifikasi.ubi.net.ProgressRequestBody;
 import com.klasifikasi.ubi.net.RetrofitClient;
 import com.klasifikasi.ubi.utils.UrlUtil;
 
-import java.io.*;
+import java.io.BufferedOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.text.SimpleDateFormat;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -40,9 +48,9 @@ import okhttp3.MultipartBody;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.RequestBody;
+import okhttp3.Response;
 import retrofit2.Call;
 import retrofit2.Callback;
-import retrofit2.Response;
 
 public class DatasetList extends AppCompatActivity {
 
@@ -51,10 +59,16 @@ public class DatasetList extends AppCompatActivity {
     private final Handler main = new Handler(Looper.getMainLooper());
     private MaterialToolbar toolbar;
 
-    // ==== training polling ====
+    // polling
     private final Handler pollHandler = new Handler(Looper.getMainLooper());
     private Runnable pollTask = null;
-    private int currentTrainingId = -1;
+
+    // ===== Opsi training (disederhanakan) =====
+    // Hanya ada 2 pilihan: Split (1) atau 5-Fold.
+    // Opsi lain otomatis aktif: summaryOnly=true (K-Fold), cmOnly=true (Split)
+    private int selectedKFold = 1;               // 1 = split 70/30, >1 = kfold
+    private boolean selectedSummaryOnly = true;  // k-fold: ringkasan saja
+    private boolean selectedCmOnly = true;       // split: hanya Confusion Matrix
 
     @SuppressLint("MissingInflatedId")
     @Override
@@ -64,8 +78,8 @@ public class DatasetList extends AppCompatActivity {
         setContentView(R.layout.activity_dataset_list);
 
         View root = findViewById(R.id.mainDatasetList);
-        ViewCompat.setOnApplyWindowInsetsListener(root, (v,insets)->{
-            v.setPadding(0,insets.getInsets(WindowInsetsCompat.Type.systemBars()).top,0,0);
+        ViewCompat.setOnApplyWindowInsetsListener(root, (v, insets) -> {
+            v.setPadding(0, insets.getInsets(WindowInsetsCompat.Type.systemBars()).top, 0, 0);
             return insets;
         });
 
@@ -85,79 +99,109 @@ public class DatasetList extends AppCompatActivity {
         RecyclerView rv = findViewById(R.id.rvDataset);
         rv.setLayoutManager(new LinearLayoutManager(this));
         adapter = new DatasetAdapter(new DatasetAdapter.Listener() {
-            @Override public void onDownload(com.klasifikasi.ubi.model.DatasetItem d) {
-                String url = com.klasifikasi.ubi.utils.UrlUtil.buildPublicUrl(d.file);
+            @Override
+            public void onDownload(DatasetItem d) {
+                String rel = (d != null) ? d.getFile() : null;
+                if (rel == null || rel.trim().isEmpty()) {
+                    Toast.makeText(DatasetList.this, "Tidak ada file untuk diunduh", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                String url = UrlUtil.buildPublicUrl(rel);
                 if (url != null) startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
             }
         });
         rv.setAdapter(adapter);
 
         findViewById(R.id.fabAddDataset).setOnClickListener(v -> onAddDataset());
-
         loadList();
     }
 
     private void loadList() {
         RetrofitClient.api().listDataset().enqueue(new Callback<List<DatasetItem>>() {
-            @Override public void onResponse(Call<List<DatasetItem>> call, Response<List<DatasetItem>> resp) {
-                if (resp.isSuccessful() && resp.body()!=null) adapter.setData(resp.body());
-                else Toast.makeText(DatasetList.this, "Gagal load dataset "+resp.code(), Toast.LENGTH_SHORT).show();
+            @Override
+            public void onResponse(Call<List<DatasetItem>> call, retrofit2.Response<List<DatasetItem>> resp) {
+                if (resp.isSuccessful() && resp.body() != null) adapter.setData(resp.body());
+                else
+                    Toast.makeText(DatasetList.this, "Gagal load dataset " + resp.code(), Toast.LENGTH_SHORT).show();
             }
-            @Override public void onFailure(Call<List<DatasetItem>> call, Throwable t) {
-                Toast.makeText(DatasetList.this, "Error: "+t.getMessage(), Toast.LENGTH_LONG).show();
+
+            @Override
+            public void onFailure(Call<List<DatasetItem>> call, Throwable t) {
+                Toast.makeText(DatasetList.this, "Error: " + t.getMessage(), Toast.LENGTH_LONG).show();
             }
         });
     }
 
-    // === 1) Dialog konfirmasi & hitung jumlah kelas ===
+    // ===== 1) Konfirmasi pembuatan dataset =====
     private void onAddDataset() {
         RetrofitClient.api().listSampel(null).enqueue(new Callback<List<Sampel>>() {
-            @Override public void onResponse(Call<List<Sampel>> call, Response<List<Sampel>> resp) {
-                if (!resp.isSuccessful() || resp.body()==null) {
-                    Toast.makeText(DatasetList.this, "Gagal ambil sampel ("+resp.code()+")", Toast.LENGTH_SHORT).show();
+            @Override
+            public void onResponse(Call<List<Sampel>> call, retrofit2.Response<List<Sampel>> resp) {
+                if (!resp.isSuccessful() || resp.body() == null) {
+                    Toast.makeText(DatasetList.this, "Gagal ambil sampel (" + resp.code() + ")", Toast.LENGTH_SHORT).show();
                     return;
                 }
                 List<Sampel> items = resp.body();
-                Map<String,Integer> count = countByClass(items);
+                Map<String, Integer> count = countByClass(items);
 
                 String pesan = "Apakah Anda ingin membuat dataset?\n\n"
-                        + "Ubi Ungu : " + count.getOrDefault("Ubi Ungu",0) + "\n"
-                        + "Ubi Putih: " + count.getOrDefault("Ubi Putih",0) + "\n"
-                        + "Ubi Jingga: " + count.getOrDefault("Ubi Jingga",0);
+                        + "Ubi Ungu : " + count.getOrDefault("Ubi Ungu", 0) + "\n"
+                        + "Ubi Putih: " + count.getOrDefault("Ubi Putih", 0) + "\n"
+                        + "Ubi Jingga: " + count.getOrDefault("Ubi Jingga", 0);
 
                 new AlertDialog.Builder(DatasetList.this)
                         .setTitle("Buat Dataset")
                         .setMessage(pesan)
                         .setNegativeButton("Batal", null)
-                        .setPositiveButton("Mulai", (d,w) -> startBuildAndUpload(items, count))
+                        .setPositiveButton("Mulai", (d, w) -> askTrainOptionsThenBuild(items, count))
                         .show();
             }
-            @Override public void onFailure(Call<List<Sampel>> call, Throwable t) {
-                Toast.makeText(DatasetList.this, "Error: "+t.getMessage(), Toast.LENGTH_LONG).show();
+
+            @Override
+            public void onFailure(Call<List<Sampel>> call, Throwable t) {
+                Toast.makeText(DatasetList.this, "Error: " + t.getMessage(), Toast.LENGTH_LONG).show();
             }
         });
     }
 
+    // ===== 1b) Hanya pilih Split vs 5-Fold =====
+    private void askTrainOptionsThenBuild(List<Sampel> items, Map<String, Integer> count) {
+        final String[] kChoices = {"1 (Split 70/30)", "5-Fold"};
+        final int[] kValues = {1, 5};
+        selectedKFold = 1; // default split
+
+        // Sesuai permintaan: opsi lain otomatis ON
+        selectedSummaryOnly = true; // k-fold → summary-only
+        selectedCmOnly = true;      // split → hanya Confusion Matrix
+
+        new AlertDialog.Builder(this)
+                .setTitle("Pilih Metode Training")
+                .setSingleChoiceItems(kChoices, 0, (dialog, which) -> selectedKFold = kValues[which])
+                .setPositiveButton("Lanjut", (dialog, which) -> startBuildAndUpload(items, count))
+                .setNegativeButton("Batal", null)
+                .show();
+    }
+
     private static String norm(String jenis) {
-        if (jenis==null) return "";
-        String j = jenis.trim().toLowerCase();
+        if (jenis == null) return "";
+        String j = jenis.trim().toLowerCase(Locale.ROOT);
         if (j.contains("ungu") || j.contains("ungi")) return "Ubi Ungu";
         if (j.contains("putih")) return "Ubi Putih";
         if (j.contains("jingga") || j.contains("orange")) return "Ubi Jingga";
         return jenis.trim();
     }
 
-    private Map<String,Integer> countByClass(List<Sampel> items) {
-        Map<String,Integer> c = new HashMap<>();
-        for (Sampel s: items) {
+    private Map<String, Integer> countByClass(List<Sampel> items) {
+        Map<String, Integer> c = new HashMap<>();
+        for (Sampel s : items) {
             String k = norm(s.jenis);
-            c.put(k, c.getOrDefault(k,0)+1);
+            c.put(k, c.getOrDefault(k, 0) + 1);
         }
         return c;
     }
 
-    // === 2) Build ZIP + upload (progress 0..70 zipping, 70..100 upload) ===
-    private void startBuildAndUpload(List<Sampel> items, Map<String,Integer> count) {
+    // ===== 2) Zip → Upload =====
+    private void startBuildAndUpload(List<Sampel> items, Map<String, Integer> count) {
         progress = new ProgressDialog(this);
         progress.setTitle("Membuat dataset");
         progress.setMessage("Menyiapkan...");
@@ -173,32 +217,31 @@ public class DatasetList extends AppCompatActivity {
                 File outDir = new File(getExternalFilesDir(null), "dataset");
                 if (!outDir.exists()) outDir.mkdirs();
                 String stamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
-                File zipFile = new File(outDir, "dataset_"+stamp+".zip");
+                File zipFile = new File(outDir, "dataset_" + stamp + ".zip");
 
                 int total = items.size();
                 if (total == 0) throw new RuntimeException("Tidak ada sampel bergambar.");
 
-                // 0–70% saat zipping
-                makeZip(items, zipFile, p -> updateProgress((int)(p * 0.7)));
+                makeZip(items, zipFile, p -> updateProgress((int) (p * 0.7)));
 
-                String nama = "Ungu: "+count.getOrDefault("Ubi Ungu",0)
-                        +" • Putih: "+count.getOrDefault("Ubi Putih",0)
-                        +" • Jingga: "+count.getOrDefault("Ubi Jingga",0);
+                String nama = "Ungu: " + count.getOrDefault("Ubi Ungu", 0)
+                        + " • Putih: " + count.getOrDefault("Ubi Putih", 0)
+                        + " • Jingga: " + count.getOrDefault("Ubi Jingga", 0);
 
-                // lanjut upload → onResponse akan auto start training
                 uploadZip(zipFile, nama);
-
             } catch (Exception e) {
-                Log.e("DATASET", "Gagal: "+e.getMessage(), e);
+                Log.e("DATASET", "Gagal: " + e.getMessage(), e);
                 main.post(() -> {
-                    if (progress!=null) progress.dismiss();
-                    Toast.makeText(DatasetList.this, "Gagal: "+e.getMessage(), Toast.LENGTH_LONG).show();
+                    if (progress != null && progress.isShowing()) progress.dismiss();
+                    Toast.makeText(DatasetList.this, "Gagal: " + e.getMessage(), Toast.LENGTH_LONG).show();
                 });
             }
         }).start();
     }
 
-    private interface IntCallback { void call(int percent); }
+    private interface IntCallback {
+        void call(int percent);
+    }
 
     private void makeZip(List<Sampel> items, File outZip, IntCallback progressCb) throws Exception {
         OkHttpClient http = new OkHttpClient();
@@ -211,14 +254,14 @@ public class DatasetList extends AppCompatActivity {
             for (Sampel s : items) {
                 i++;
                 String cls = norm(s.jenis);
-                if (s.foto==null || s.foto.trim().isEmpty()) continue;
+                if (s.foto == null || s.foto.trim().isEmpty()) continue;
 
-                String url = buildFotoUrl(s.foto);
+                String url = UrlUtil.buildPublicUrl(s.foto);
                 if (url == null) continue;
 
-                okhttp3.Response resp = http.newCall(new Request.Builder().url(url).build()).execute();
-                if (!resp.isSuccessful() || resp.body()==null) {
-                    if (resp.body()!=null) resp.close();
+                Response resp = http.newCall(new Request.Builder().url(url).build()).execute();
+                if (!resp.isSuccessful() || resp.body() == null) {
+                    if (resp.body() != null) resp.close();
                     continue;
                 }
                 byte[] bytes = resp.body().bytes();
@@ -229,22 +272,22 @@ public class DatasetList extends AppCompatActivity {
                 zos.write(bytes);
                 zos.closeEntry();
 
-                int pct = Math.min(100, (int)Math.round((i * 100.0) / n));
+                int pct = Math.min(100, (int) Math.round((i * 100.0) / n));
                 progressCb.call(pct);
             }
             zos.finish();
         }
     }
 
-    private String buildFotoUrl(String rel) { return UrlUtil.buildPublicUrl(rel); }
-
     private void updateProgress(int pct) {
-        main.post(() -> { if (progress != null) progress.setProgress(pct); });
+        main.post(() -> {
+            if (progress != null) progress.setProgress(pct);
+        });
     }
 
     private void uploadZip(File zipFile, String nama) {
-        ProgressRequestBody.Listener listener = (wrote,total) -> {
-            int pctUp = total>0 ? (int)(wrote * 100 / total) : 0;
+        ProgressRequestBody.Listener listener = (wrote, total) -> {
+            int pctUp = total > 0 ? (int) (wrote * 100 / total) : 0;
             int overall = 70 + (pctUp * 30 / 100); // 70..100
             updateProgress(overall);
         };
@@ -255,97 +298,135 @@ public class DatasetList extends AppCompatActivity {
 
         ApiService api = RetrofitClient.api();
         api.uploadDataset(namaBody, part).enqueue(new Callback<DatasetItem>() {
-            @Override public void onResponse(Call<DatasetItem> call, Response<DatasetItem> resp) {
-                if (!resp.isSuccessful() || resp.body()==null) {
-                    if (progress!=null) progress.dismiss();
+            @Override
+            public void onResponse(Call<DatasetItem> call, retrofit2.Response<DatasetItem> resp) {
+                if (!resp.isSuccessful() || resp.body() == null) {
+                    if (progress != null) progress.dismiss();
                     String err = "";
-                    try { if (resp.errorBody()!=null) err = resp.errorBody().string(); } catch (Exception ignored) {}
+                    try {
+                        if (resp.errorBody() != null) err = resp.errorBody().string();
+                    } catch (Exception ignored) {
+                    }
                     Toast.makeText(DatasetList.this,
-                            "Upload gagal ("+resp.code()+") "+err, Toast.LENGTH_LONG).show();
+                            "Upload gagal (" + resp.code() + ") " + err, Toast.LENGTH_LONG).show();
                     return;
                 }
-
-                // upload sukses → refresh list
                 loadList();
 
-                // === Auto mulai training ===
+                // === jalankan otomatis: color → texture → fused
                 DatasetItem saved = resp.body();
-                currentTrainingId = saved.id;
-
-                // reset dialog untuk training
                 if (progress != null) {
-                    progress.setTitle("Training model");
+                    progress.setTitle("Training model (color)");
                     progress.setMessage("Menunggu worker...");
                     progress.setProgress(0);
                     progress.show();
                 }
-
-                startTraining(saved.id);
+                startTrainingAllSequential(saved.id, selectedKFold, selectedSummaryOnly, selectedCmOnly);
             }
 
-            @Override public void onFailure(Call<DatasetItem> call, Throwable t) {
-                if (progress!=null) progress.dismiss();
-                Toast.makeText(DatasetList.this, "Error upload: "+t.getMessage(), Toast.LENGTH_LONG).show();
+            @Override
+            public void onFailure(Call<DatasetItem> call, Throwable t) {
+                if (progress != null) progress.dismiss();
+                Toast.makeText(DatasetList.this, "Error upload: " + t.getMessage(), Toast.LENGTH_LONG).show();
             }
         });
     }
 
-    // === 3) Mulai training & polling status ===
-    private void startTraining(int datasetId) {
-        RetrofitClient.api().startTrain(datasetId).enqueue(new Callback<TrainStatus>() {
-            @Override public void onResponse(Call<TrainStatus> call, Response<TrainStatus> resp) {
-                if (!resp.isSuccessful()) {
-                    if (progress!=null) progress.dismiss();
-                    Toast.makeText(DatasetList.this, "Gagal mulai training ("+resp.code()+")", Toast.LENGTH_LONG).show();
-                    return;
+    // ===== 3) Training otomatis berurutan =====
+    private void startTrainingAllSequential(int datasetId, int kfold, boolean summaryOnly, boolean cmOnly) {
+        List<String> queue = new ArrayList<>(Arrays.asList("color", "texture", "fused"));
+        runNext(datasetId, kfold, queue, summaryOnly, cmOnly);
+    }
+
+    private void runNext(int datasetId, int kfold, List<String> queue, boolean summaryOnly, boolean cmOnly) {
+        if (queue.isEmpty()) {
+            if (progress != null) progress.dismiss();
+            // tampilkan dialog hasil
+            RetrofitClient.api().getTrainStatus(datasetId).enqueue(new Callback<TrainStatus>() {
+                @Override
+                public void onResponse(Call<TrainStatus> call, retrofit2.Response<TrainStatus> resp) {
+                    if (resp.isSuccessful() && resp.body() != null) showResultDialog(resp.body());
+                    loadList();
                 }
-                // mulai polling tiap 1.5s
-                startPolling(datasetId);
-            }
-            @Override public void onFailure(Call<TrainStatus> call, Throwable t) {
-                if (progress!=null) progress.dismiss();
-                Toast.makeText(DatasetList.this, "Error start training: "+t.getMessage(), Toast.LENGTH_LONG).show();
-            }
-        });
+
+                @Override
+                public void onFailure(Call<TrainStatus> call, Throwable t) {
+                    loadList();
+                }
+            });
+            return;
+        }
+        String stream = queue.remove(0);
+        if (progress != null) {
+            progress.setTitle("Training model (" + stream + ")");
+            progress.setMessage("Menunggu worker...");
+            progress.setProgress(0);
+            progress.show();
+        }
+        startTrainingSingle(datasetId, kfold, stream, summaryOnly, cmOnly, () ->
+                runNext(datasetId, kfold, queue, summaryOnly, cmOnly));
     }
 
-    private void startPolling(int datasetId) {
-        stopPolling(); // pastikan 1 task saja
+    private void startTrainingSingle(int datasetId, int kfold, String stream,
+                                     boolean summaryOnly, boolean cmOnly, Runnable onDone) {
+        int epochs = (kfold > 1) ? 5 : 10;
+        String task = (kfold > 1) ? "kfold" : "split";
+
+        StartTrainRequest body = new StartTrainRequest(kfold, task, epochs);
+        body.stream = stream;                  // "color"|"texture"|"fused"
+        body.kfold_summary_only = summaryOnly; // k-fold
+        body.cm_only = cmOnly;                 // split
+
+        RetrofitClient.api().startTrain(datasetId, body)
+                .enqueue(new Callback<TrainStatus>() {
+                    @Override
+                    public void onResponse(Call<TrainStatus> call, retrofit2.Response<TrainStatus> resp) {
+                        if (!resp.isSuccessful()) {
+                            if (progress != null) progress.dismiss();
+                            Toast.makeText(DatasetList.this, "Gagal mulai (" + stream + "): " + resp.code(), Toast.LENGTH_LONG).show();
+                            onDone.run();
+                            return;
+                        }
+                        pollUntilFinish(datasetId, onDone);
+                    }
+
+                    @Override
+                    public void onFailure(Call<TrainStatus> call, Throwable t) {
+                        if (progress != null) progress.dismiss();
+                        Toast.makeText(DatasetList.this, "Error start (" + stream + "): " + t.getMessage(), Toast.LENGTH_LONG).show();
+                        onDone.run();
+                    }
+                });
+    }
+
+    private void pollUntilFinish(int datasetId, Runnable onFinish) {
+        stopPolling();
         pollTask = new Runnable() {
-            @Override public void run() {
+            @Override
+            public void run() {
                 RetrofitClient.api().getTrainStatus(datasetId).enqueue(new Callback<TrainStatus>() {
-                    @Override public void onResponse(Call<TrainStatus> call, Response<TrainStatus> resp) {
-                        if (!resp.isSuccessful() || resp.body()==null) {
-                            // coba lagi nanti
+                    @Override
+                    public void onResponse(Call<TrainStatus> call, retrofit2.Response<TrainStatus> resp) {
+                        if (!resp.isSuccessful() || resp.body() == null) {
                             pollHandler.postDelayed(pollTask, 1500);
                             return;
                         }
                         TrainStatus s = resp.body();
-                        // update UI progress & message
                         if (progress != null) {
                             progress.setProgress(Math.max(0, Math.min(100, s.progress)));
                             if (s.message != null) progress.setMessage(s.message);
                         }
-
-                        if ("success".equalsIgnoreCase(s.status)) {
-                            if (progress != null) progress.dismiss();
+                        if ("success".equalsIgnoreCase(s.status) || "failed".equalsIgnoreCase(s.status)) {
                             stopPolling();
-                            showResultDialog(s);
-                            loadList(); // refresh list dataset (kalau ada kolom trained_at dsb)
-                        } else if ("failed".equalsIgnoreCase(s.status)) {
-                            if (progress != null) progress.dismiss();
-                            stopPolling();
-                            Toast.makeText(DatasetList.this,
-                                    "Training gagal" + (s.message!=null? (": "+s.message):""),
-                                    Toast.LENGTH_LONG).show();
+                            onFinish.run();
                         } else {
-                            // running → lanjut polling
                             pollHandler.postDelayed(pollTask, 1500);
                         }
                     }
-                    @Override public void onFailure(Call<TrainStatus> call, Throwable t) {
-                        // jeda dulu lalu coba lagi
-                        pollHandler.postDelayed(pollTask, 2000);
+
+                    @Override
+                    public void onFailure(Call<TrainStatus> call, Throwable t) {
+                        pollHandler.postDelayed(pollTask, 1800);
                     }
                 });
             }
@@ -360,34 +441,35 @@ public class DatasetList extends AppCompatActivity {
         }
     }
 
+    // ===== Hasil =====
     private void showResultDialog(TrainStatus s) {
-        StringBuilder sb = new StringBuilder();
-        if (s.metrics != null) {
-            sb//.append("Akurasi akhir: ")
-                    //.append(String.format(Locale.US, "%.2f%%", s.metrics.val_accuracy_last*100))
-                    .append("\nKelas: ").append(s.metrics.classes);
-        }
         new AlertDialog.Builder(this)
                 .setTitle("Training Selesai")
-                .setMessage(sb.length()>0 ? sb.toString() : "Model berhasil dibuat.")
-                .setPositiveButton("Unduh TFLite", (d,w) -> {
-                    String url = UrlUtil.buildPublicUrl(s.result_tflite);
-                    if (url != null) startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
-                })
-                .setNeutralButton("Unduh H5", (d,w) -> {
-                    String url = UrlUtil.buildPublicUrl(s.result_model);
-                    if (url != null) startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
-                })
-                .setNegativeButton("Labels", (d,w) -> {
-                    String url = UrlUtil.buildPublicUrl(s.result_labels);
-                    if (url != null) startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
-                })
+                .setMessage("Model & metrik tersedia. Buka dari halaman dataset untuk melihat artefak.")
+                .setPositiveButton("OK", null)
                 .show();
     }
 
-    @Override protected void onDestroy() {
+    @Override
+    protected void onDestroy() {
         super.onDestroy();
         stopPolling();
         if (progress != null && progress.isShowing()) progress.dismiss();
+    }
+
+    // ===== util refleksi (ambil field string dari objek images) =====
+    private static @Nullable String imgField(Object images, String name) {
+        if (images == null) return null;
+        try {
+            java.lang.reflect.Field f = images.getClass().getField(name); // public field
+            f.setAccessible(true);
+            Object v = f.get(images);
+            if (v instanceof String) {
+                String s = (String) v;
+                return (s != null && !s.trim().isEmpty()) ? s : null;
+            }
+        } catch (Throwable ignore) {
+        }
+        return null;
     }
 }

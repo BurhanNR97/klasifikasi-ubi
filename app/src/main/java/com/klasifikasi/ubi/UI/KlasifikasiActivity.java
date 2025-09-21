@@ -42,9 +42,9 @@ import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.FileReader;
-import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
@@ -266,38 +266,94 @@ public class KlasifikasiActivity extends AppCompatActivity {
             JSONObject st = httpGetJson(ApiConst.BASE_API_URL + "dataset/" + datasetId + "/train");
             JSONObject artifacts = st.optJSONObject("artifacts");
 
+            // ===== Labels =====
             String labelsUrl = (artifacts != null) ? artifacts.optString("labels", "") : "";
-            if (labelsUrl == null || labelsUrl.isEmpty()) labelsUrl = "storage/models/dataset_" + datasetId + "/labels.json";
+            if (labelsUrl == null || labelsUrl.isEmpty()) {
+                labelsUrl = "storage/models/dataset_" + datasetId + "/labels.json";
+            }
             downloadIfNeeded(fileUrl(labelsUrl), fLabels);
             labels = readLabels(fLabels);
 
             boolean any = false;
+            if (artifacts == null) return false;
 
-            if (artifacts != null) {
-                JSONObject color = artifacts.optJSONObject("color");
-                String uColor = (color != null) ? firstNonEmpty(color, "tflite", "keras", "h5") : null;
-                if (uColor != null && uColor.endsWith(".tflite")) {
-                    try { downloadIfNeeded(fileUrl(uColor), fColor); itColor = openInterpreter(fColor); modelColorReady = true; any = true; }
-                    catch (Exception e) { reportModelError("color", e, fColor); }
-                }
-                JSONObject tex = artifacts.optJSONObject("texture");
-                String uTex = (tex != null) ? firstNonEmpty(tex, "tflite", "keras", "h5") : null;
-                if (uTex != null && uTex.endsWith(".tflite")) {
-                    try { downloadIfNeeded(fileUrl(uTex), fTexture); itTexture = openInterpreter(fTexture); modelTexReady = true; any = true; }
-                    catch (Exception e) { reportModelError("texture", e, fTexture); }
-                }
-                JSONObject fused = artifacts.optJSONObject("fused");
-                String uFused = (fused != null) ? firstNonEmpty(fused, "tflite", "keras") : null;
-                if (uFused != null && uFused.endsWith(".tflite")) {
-                    try { downloadIfNeeded(fileUrl(uFused), fFused); itFused = openInterpreter(fFused); modelFusedReady = true; any = true; }
-                    catch (Exception e) { reportModelError("fused", e, fFused); }
+            // helper ambil path dari objek kind
+            java.util.function.Function<JSONObject, String> pickTflite = (o) -> {
+                if (o == null) return null;
+                String t = o.optString("tflite", "");
+                if (t != null && !t.isEmpty()) return t;
+                // fallback flex
+                String tf = o.optString("tflite_flex", "");
+                if (tf != null && !tf.isEmpty()) return tf;
+                // kalau terpaksa, biarkan non-tflite (tidak dipakai di Android)
+                return null;
+            };
+
+            // ======== 1) MODE UMUM (tanpa suffix fold) ========
+            String uColor = pickTflite.apply(artifacts.optJSONObject("color"));
+            String uTex   = pickTflite.apply(artifacts.optJSONObject("texture"));
+            String uFused = pickTflite.apply(artifacts.optJSONObject("fused"));
+
+            // ======== 2) MODE K-FOLD (last fold) ========
+            JSONObject kfoldMaybe = artifacts.optJSONObject("kfold_models_maybe");
+            if (uColor == null && kfoldMaybe != null) {
+                uColor = pickTflite.apply(kfoldMaybe.optJSONObject("color_last_fold"));
+            }
+            if (uTex == null && kfoldMaybe != null) {
+                uTex = pickTflite.apply(kfoldMaybe.optJSONObject("texture_last_fold"));
+            }
+            if (uFused == null && kfoldMaybe != null) {
+                uFused = pickTflite.apply(kfoldMaybe.optJSONObject("fused_last_fold"));
+            }
+
+            // ===== Unduh & buka interpreter =====
+            // COLOR
+            if (uColor != null && uColor.endsWith(".tflite")) {
+                try {
+                    downloadIfNeeded(fileUrl(uColor), fColor);
+                    itColor = openInterpreter(fColor);
+                    modelColorReady = true; any = true;
+                } catch (Exception e) {
+                    // coba _flex kalau ada
+                    String alt = uColor.replace(".tflite", "_flex.tflite");
+                    try { downloadIfNeeded(fileUrl(alt), fColor); itColor = openInterpreter(fColor); modelColorReady = true; any = true; }
+                    catch (Exception ex) { reportModelError("color", e, fColor); }
                 }
             }
+
+            // TEXTURE
+            if (uTex != null && uTex.endsWith(".tflite")) {
+                try {
+                    downloadIfNeeded(fileUrl(uTex), fTexture);
+                    itTexture = openInterpreter(fTexture);
+                    modelTexReady = true; any = true;
+                } catch (Exception e) {
+                    String alt = uTex.replace(".tflite", "_flex.tflite");
+                    try { downloadIfNeeded(fileUrl(alt), fTexture); itTexture = openInterpreter(fTexture); modelTexReady = true; any = true; }
+                    catch (Exception ex) { reportModelError("texture", e, fTexture); }
+                }
+            }
+
+            // FUSED
+            if (uFused != null && uFused.endsWith(".tflite")) {
+                try {
+                    downloadIfNeeded(fileUrl(uFused), fFused);
+                    itFused = openInterpreter(fFused);
+                    modelFusedReady = true; any = true;
+                } catch (Exception e) {
+                    String alt = uFused.replace(".tflite", "_flex.tflite");
+                    try { downloadIfNeeded(fileUrl(alt), fFused); itFused = openInterpreter(fFused); modelFusedReady = true; any = true; }
+                    catch (Exception ex) { reportModelError("fused", e, fFused); }
+                }
+            }
+
             return any;
         } catch (Exception e) {
+            Log.e(TAG, "ensureModelsReadyViaStatus: " + e.getMessage(), e);
             return false;
         }
     }
+
 
     private boolean ensureModelsReadyFallback(File dir) {
         try {
@@ -308,18 +364,18 @@ public class KlasifikasiActivity extends AppCompatActivity {
 
             boolean any = false;
 
-            try { downloadIfNeeded(fileUrl(root + "model_final_color.tflite"), fColor);
+            try { downloadIfNeeded(fileUrl(root + "model_final_color_fold5.tflite"), fColor);
                 itColor = openInterpreter(fColor); modelColorReady = true; any = true; }
             catch (Exception e) { reportModelError("color", e, fColor); }
 
-            try { downloadIfNeeded(fileUrl(root + "model_final_texture.tflite"), fTexture);
+            try { downloadIfNeeded(fileUrl(root + "model_final_texture_fold5.tflite"), fTexture);
                 itTexture = openInterpreter(fTexture); modelTexReady = true; any = true; }
             catch (Exception e) { reportModelError("texture", e, fTexture); }
 
-            try { downloadIfNeeded(fileUrl(root + "model_final_fused.tflite"), fFused);
+            try { downloadIfNeeded(fileUrl(root + "model_final_fused_fold5.tflite"), fFused);
                 itFused = openInterpreter(fFused); modelFusedReady = true; any = true; }
             catch (Exception e1) {
-                try { downloadIfNeeded(fileUrl(root + "model_final_fused_flex.tflite"), fFused);
+                try { downloadIfNeeded(fileUrl(root + "model_final_fused_flex_fold5.tflite"), fFused);
                     itFused = openInterpreter(fFused); modelFusedReady = true; any = true; }
                 catch (Exception e2) { reportModelError("fused", e2, fFused); }
             }
@@ -348,17 +404,6 @@ public class KlasifikasiActivity extends AppCompatActivity {
         return base + relativeOrAbs;
     }
 
-    private String firstNonEmpty(JSONObject o, String... keys) {
-        for (String k : keys) {
-            String v = o.optString(k, "");
-            if (v != null && !v.isEmpty()) return v;
-        }
-        return null;
-    }
-
-    /* ===============================
-       HTTP helpers
-       =============================== */
     private JSONObject httpGetJson(String url) throws IOException, JSONException {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setConnectTimeout(15000);
@@ -723,7 +768,7 @@ public class KlasifikasiActivity extends AppCompatActivity {
         root.setPadding(pad, pad, pad, pad);
 
         android.widget.TextView t1 = new android.widget.TextView(this);
-        TextViewCompat.setTextAppearance(t1, com.google.android.material.R.style.TextAppearance_Material3_TitleMedium);
+        TextViewCompat.setTextAppearance(t1, android.graphics.Typeface.BOLD);
         t1.setText("Langkah Gambar");
         root.addView(t1);
 
@@ -735,7 +780,7 @@ public class KlasifikasiActivity extends AppCompatActivity {
 
         root.addView(spaceBig());
         android.widget.TextView t2 = new android.widget.TextView(this);
-        TextViewCompat.setTextAppearance(t2, com.google.android.material.R.style.TextAppearance_Material3_TitleMedium);
+        TextViewCompat.setTextAppearance(t2, android.graphics.Typeface.BOLD);
         t2.setText("Cuplikan Matriks 0..255 (16x16)");
         root.addView(t2);
 
@@ -803,7 +848,7 @@ public class KlasifikasiActivity extends AppCompatActivity {
         android.widget.LinearLayout box = new android.widget.LinearLayout(this);
         box.setOrientation(android.widget.LinearLayout.VERTICAL);
         android.widget.TextView tv = new android.widget.TextView(this);
-        TextViewCompat.setTextAppearance(tv, com.google.android.material.R.style.TextAppearance_Material3_TitleSmall);
+        TextViewCompat.setTextAppearance(tv, android.graphics.Typeface.BOLD);
         tv.setText(title);
         android.widget.TextView pre = new android.widget.TextView(this);
         pre.setTypeface(android.graphics.Typeface.MONOSPACE);
@@ -817,7 +862,7 @@ public class KlasifikasiActivity extends AppCompatActivity {
         android.widget.LinearLayout box = new android.widget.LinearLayout(this);
         box.setOrientation(android.widget.LinearLayout.VERTICAL);
         android.widget.TextView tv = new android.widget.TextView(this);
-        TextViewCompat.setTextAppearance(tv, com.google.android.material.R.style.TextAppearance_Material3_TitleSmall);
+        TextViewCompat.setTextAppearance(tv, android.graphics.Typeface.BOLD);
         tv.setText(title);
         android.widget.ImageView iv = new android.widget.ImageView(this);
         iv.setAdjustViewBounds(true);
@@ -931,7 +976,7 @@ public class KlasifikasiActivity extends AppCompatActivity {
 
                 // field file
                 InputStream is = getContentResolver().openInputStream(imageUri);
-                byte[] img = readBytes(is); // kamu sudah punya helper ini di file
+                byte[] img = readBytes(is); // helper di file ini
                 String mime = getContentResolver().getType(imageUri);
                 if (mime == null || mime.trim().isEmpty()) mime = "image/jpeg";
                 writeFileField(os, boundary, "image", "input.jpg", mime, img);
@@ -949,7 +994,7 @@ public class KlasifikasiActivity extends AppCompatActivity {
                 if (code >= 200 && code < 300) {
                     Toast.makeText(this, "Hasil tersimpan di server.", Toast.LENGTH_SHORT).show();
                 } else {
-                    Log.e("gagal simpan", resp);
+                    Log.e(TAG, "Gagal simpan (" + code + "): " + resp);
                     Toast.makeText(this, "Gagal simpan (" + code + "): " + resp, Toast.LENGTH_LONG).show();
                 }
             });
