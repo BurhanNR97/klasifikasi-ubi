@@ -9,6 +9,7 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.ColorMatrix;
 import android.graphics.ColorMatrixColorFilter;
+import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -47,6 +48,7 @@ import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.MappedByteBuffer;
@@ -59,6 +61,9 @@ import java.util.Map;
 
 /**
  * Klasifikasi: Warna, Tekstur, Gabungan (+export CSV & simpan hasil ke server)
+ * + Open-set rejection (tanpa kelas tambahan) menggunakan 2 ambang:
+ *   - rejectThreshold: minimal top-1 softmax
+ *   - rejectMargin:    minimal (top1 - top2)
  */
 public class KlasifikasiActivity extends AppCompatActivity {
 
@@ -82,7 +87,7 @@ public class KlasifikasiActivity extends AppCompatActivity {
     private Uri pickedUri = null;
 
     // Files & Interpreters
-    private File fLabels, fColor, fTexture, fFused, fSingle;
+    private File fLabels, fColor, fTexture, fFused, fSingle, fMeta;
     private Interpreter itColor, itTexture, itFused, itSingle;
     private volatile boolean modelColorReady = false;
     private volatile boolean modelTexReady   = false;
@@ -100,6 +105,10 @@ public class KlasifikasiActivity extends AppCompatActivity {
     // data untuk “perhitungan manual”
     private Bitmap lastSrc, lastColorBmp, lastTextureBmp;
     private float[][][][] lastInColor, lastInTex;
+
+    // --- Open-set rejection (default, bisa ditimpa meta.json) ---
+    private float rejectThreshold = 0.80f; // minimal top-1
+    private float rejectMargin    = 0.15f; // minimal (top1-top2)
 
     @SuppressLint("MissingInflatedId")
     @Override
@@ -137,7 +146,7 @@ public class KlasifikasiActivity extends AppCompatActivity {
         if (id1 != null && !id1.isEmpty()) userId = id1;
         else if (id2 != null && !id2.isEmpty()) userId = id2;
 
-        // UI refs utama
+        // UI refs
         imgPreview = findViewById(R.id.imgPreview);
         progress   = findViewById(R.id.progress);
         tvStatus   = findViewById(R.id.tvStatus);
@@ -186,7 +195,6 @@ public class KlasifikasiActivity extends AppCompatActivity {
             boolean ok = prepareModelsAuto();
             runOnUiThread(() -> {
                 setBusy(false, ok ? "Model siap." : "Gagal menyiapkan model");
-                // tampilkan kartu sesuai model
                 cardWarna.setVisibility(modelColorReady || modelSingleReady ? View.VISIBLE : View.GONE);
                 cardTekstur.setVisibility(modelTexReady ? View.VISIBLE : View.GONE);
                 cardFused.setVisibility((modelFusedReady || (modelColorReady && modelTexReady)) ? View.VISIBLE : View.GONE);
@@ -250,9 +258,14 @@ public class KlasifikasiActivity extends AppCompatActivity {
             fTexture = new File(dir, "model_final_texture.tflite");
             fFused   = new File(dir, "model_final_fused.tflite");
             fSingle  = new File(dir, "model_single.tflite");
+            fMeta    = new File(dir, "meta.json");
 
             boolean ok = ensureModelsReadyViaStatus(dir);
             if (!ok) ok = ensureModelsReadyFallback(dir);
+
+            // baca meta (threshold, margin) jika ada
+            applyMetaIfAvailable(fMeta);
+
             return ok;
         } catch (Exception e) {
             Log.e(TAG, "prepareModelsAuto: " + e.getMessage(), e);
@@ -274,27 +287,29 @@ public class KlasifikasiActivity extends AppCompatActivity {
             downloadIfNeeded(fileUrl(labelsUrl), fLabels);
             labels = readLabels(fLabels);
 
+            // ===== Meta (threshold & margin) =====
+            String metaUrl = (artifacts != null) ? artifacts.optString("meta", "") : "";
+            if (metaUrl == null || metaUrl.isEmpty()) {
+                metaUrl = "storage/models/dataset_" + datasetId + "/meta.json";
+            }
+            try { downloadIfNeeded(fileUrl(metaUrl), fMeta); } catch (Exception ignore) {}
+
             boolean any = false;
             if (artifacts == null) return false;
 
-            // helper ambil path dari objek kind
             java.util.function.Function<JSONObject, String> pickTflite = (o) -> {
                 if (o == null) return null;
                 String t = o.optString("tflite", "");
                 if (t != null && !t.isEmpty()) return t;
-                // fallback flex
                 String tf = o.optString("tflite_flex", "");
                 if (tf != null && !tf.isEmpty()) return tf;
-                // kalau terpaksa, biarkan non-tflite (tidak dipakai di Android)
                 return null;
             };
 
-            // ======== 1) MODE UMUM (tanpa suffix fold) ========
             String uColor = pickTflite.apply(artifacts.optJSONObject("color"));
             String uTex   = pickTflite.apply(artifacts.optJSONObject("texture"));
             String uFused = pickTflite.apply(artifacts.optJSONObject("fused"));
 
-            // ======== 2) MODE K-FOLD (last fold) ========
             JSONObject kfoldMaybe = artifacts.optJSONObject("kfold_models_maybe");
             if (uColor == null && kfoldMaybe != null) {
                 uColor = pickTflite.apply(kfoldMaybe.optJSONObject("color_last_fold"));
@@ -306,22 +321,18 @@ public class KlasifikasiActivity extends AppCompatActivity {
                 uFused = pickTflite.apply(kfoldMaybe.optJSONObject("fused_last_fold"));
             }
 
-            // ===== Unduh & buka interpreter =====
-            // COLOR
             if (uColor != null && uColor.endsWith(".tflite")) {
                 try {
                     downloadIfNeeded(fileUrl(uColor), fColor);
                     itColor = openInterpreter(fColor);
                     modelColorReady = true; any = true;
                 } catch (Exception e) {
-                    // coba _flex kalau ada
                     String alt = uColor.replace(".tflite", "_flex.tflite");
                     try { downloadIfNeeded(fileUrl(alt), fColor); itColor = openInterpreter(fColor); modelColorReady = true; any = true; }
                     catch (Exception ex) { reportModelError("color", e, fColor); }
                 }
             }
 
-            // TEXTURE
             if (uTex != null && uTex.endsWith(".tflite")) {
                 try {
                     downloadIfNeeded(fileUrl(uTex), fTexture);
@@ -334,7 +345,6 @@ public class KlasifikasiActivity extends AppCompatActivity {
                 }
             }
 
-            // FUSED
             if (uFused != null && uFused.endsWith(".tflite")) {
                 try {
                     downloadIfNeeded(fileUrl(uFused), fFused);
@@ -361,9 +371,10 @@ public class KlasifikasiActivity extends AppCompatActivity {
             downloadIfNeeded(fileUrl(root + "labels.json"), fLabels);
             labels = readLabels(fLabels);
 
+            try { downloadIfNeeded(fileUrl(root + "meta.json"), fMeta); } catch (Exception ignore) {}
+
             boolean any = false;
 
-            // 1) Coba nama "tanpa fold" (split mode & sebagian backend)
             try { downloadIfNeeded(fileUrl(root + "model_final_color.tflite"), fColor);
                 itColor = openInterpreter(fColor); modelColorReady = true; any = true; }
             catch (Exception ignore) {}
@@ -378,7 +389,6 @@ public class KlasifikasiActivity extends AppCompatActivity {
                 itFused = openInterpreter(fFused); modelFusedReady = true; any = true;
             } catch (Exception ignore) {}
 
-            // 2) Jika masih belum ada, coba varian fold (k dari 10 turun ke 2)
             if (!(modelColorReady && modelTexReady && modelFusedReady)) {
                 for (int k = 10; k >= 2; k--) {
                     if (!modelColorReady) {
@@ -402,7 +412,6 @@ public class KlasifikasiActivity extends AppCompatActivity {
                 }
             }
 
-            // 3) Fallback single .tflite (jaga-jaga)
             if (!(modelColorReady || modelTexReady || modelFusedReady)) {
                 String[] names = { "model_final.tflite", "model.tflite", "final.tflite" };
                 for (String n : names) {
@@ -418,6 +427,31 @@ public class KlasifikasiActivity extends AppCompatActivity {
         }
     }
 
+    private void applyMetaIfAvailable(File meta) {
+        try {
+            if (meta != null && meta.exists() && meta.length() > 2) {
+                String s = readAll(new java.io.FileInputStream(meta));
+                JSONObject o = new JSONObject(s);
+
+                // Global (sesuai trainer Python)
+                double thG = o.optDouble("reject_threshold_global", Double.NaN);
+                double mgG = o.optDouble("reject_margin_global",    Double.NaN);
+
+                // Fallback kompatibel (versi lama)
+                if (Double.isNaN(thG)) thG = o.optDouble("reject_threshold", Double.NaN);
+                if (Double.isNaN(mgG)) mgG = o.optDouble("reject_margin",    Double.NaN);
+
+                if (!Double.isNaN(thG) && thG > 0 && thG < 1) rejectThreshold = (float) thG;
+                if (!Double.isNaN(mgG) && mgG > 0 && mgG < 1) rejectMargin    = (float) mgG;
+
+                // (Opsional) Jika ingin pakai per-class threshold suatu saat:
+                // JSONObject pc = o.optJSONObject("per_class");
+                // if (pc != null) { JSONArray conf = pc.optJSONArray("conf"); JSONArray marg = pc.optJSONArray("margin"); ... }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "applyMetaIfAvailable: " + e.getMessage(), e);
+        }
+    }
 
     private String fileUrl(String relativeOrAbs) {
         if (relativeOrAbs == null) return null;
@@ -425,14 +459,12 @@ public class KlasifikasiActivity extends AppCompatActivity {
         String base = ApiConst.BASE_FILE_URL;
         if (!base.endsWith("/")) base += "/";
         if (relativeOrAbs.startsWith("/")) relativeOrAbs = relativeOrAbs.substring(1);
-        // bersihkan double slash yang tidak di skema
         String url = base + relativeOrAbs;
         while (url.contains("://") && url.replace("://","§§").contains("//")) {
             url = url.replace("://","§§").replace("//","/").replace("§§","://");
         }
         return url;
     }
-
 
     private JSONObject httpGetJson(String url) throws IOException, JSONException {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
@@ -509,7 +541,7 @@ public class KlasifikasiActivity extends AppCompatActivity {
     }
 
     /* ===============================
-       Klasifikasi
+       Klasifikasi + open-set rejection
        =============================== */
     private void onClassify() {
         if (pickedUri == null) {
@@ -559,10 +591,11 @@ public class KlasifikasiActivity extends AppCompatActivity {
                     probsSingle = (outS != null && outS.length>0) ? outS[0] : null;
                 }
 
-                Result rColor  = (probsColor  != null) ? argmax1D(probsColor)  : new Result(-1,0);
-                Result rTex    = (probsTex    != null) ? argmax1D(probsTex)    : new Result(-1,0);
-                Result rFused  = (probsFused  != null) ? argmax1D(probsFused)  : new Result(-1,0);
-                Result rSingle = (probsSingle != null) ? argmax1D(probsSingle) : new Result(-1,0);
+                // ==== Open-set selection ====
+                Result rColor  = (probsColor  != null) ? pickWithRejection(probsColor)  : new Result(-1,0);
+                Result rTex    = (probsTex    != null) ? pickWithRejection(probsTex)    : new Result(-1,0);
+                Result rFused  = (probsFused  != null) ? pickWithRejection(probsFused)  : new Result(-1,0);
+                Result rSingle = (probsSingle != null) ? pickWithRejection(probsSingle) : new Result(-1,0);
 
                 // simpan untuk manual
                 lastSrc = src;
@@ -610,7 +643,7 @@ public class KlasifikasiActivity extends AppCompatActivity {
                     }
 
                     if (rColor.index < 0 && rTex.index < 0 && rFused.index < 0 && rSingle.index < 0) {
-                        Toast.makeText(this, "Tidak ada hasil prediksi.", Toast.LENGTH_LONG).show();
+                        Toast.makeText(this, "Tidak ada hasil prediksi (ditolak open-set).", Toast.LENGTH_LONG).show();
                     }
                 });
 
@@ -628,35 +661,63 @@ public class KlasifikasiActivity extends AppCompatActivity {
     }
 
     private String formatPred(Result r){
-        if (r.index < 0) return "-";
-        String name = (r.index < labels.length && r.index >= 0) ? labels[r.index] : ("#" + r.index);
+        if (r.index < 0) return "Tidak dikenal";
+        String name = (labels != null && r.index >= 0 && r.index < labels.length)
+                ? labels[r.index] : ("Kelas#" + r.index);
         return String.format(Locale.US, "%.1f%% %s", r.conf * 100f, name);
     }
 
     private void showOrHide(View card, android.widget.TextView pred, android.widget.TextView conf, Result r) {
-        if (r.index < 0) { card.setVisibility(View.GONE); return; }
         card.setVisibility(View.VISIBLE);
-        String name = (r.index >= 0 && r.index < labels.length) ? labels[r.index] : ("#" + r.index);
+        if (r.index < 0) {
+            pred.setText("Prediksi: Bukan ubi / tidak dikenal");
+            conf.setText(String.format(Locale.US,
+                    "Max softmax: %.1f%% • Syarat: conf ≥ %.0f%% & margin ≥ %.0f%%",
+                    r.conf * 100f, rejectThreshold * 100f, rejectMargin * 100f));
+            return;
+        }
+        String name = (labels != null && r.index >= 0 && r.index < labels.length)
+                ? labels[r.index] : ("Kelas#" + r.index);
+        conf.setText(String.format(Locale.US,
+                "Confidence: %.1f%% • Syarat: conf ≥ %.0f%% & margin ≥ %.0f%%",
+                r.conf * 100f, rejectThreshold * 100f, rejectMargin * 100f));
         pred.setText("Prediksi: " + name);
-        conf.setText(String.format(Locale.US, "Confidence: %.1f%%", r.conf * 100f));
     }
 
     private static class Result { int index; float conf; Result(int i, float c){ index=i; conf=c; } }
-    private Result argmax1D(float[] probs) {
+
+    /** Open-set: tolak jika top1 < threshold atau (top1 - top2) < margin */
+    private Result pickWithRejection(float[] probs) {
         if (probs == null || probs.length == 0) return new Result(-1, 0f);
         int best = 0; float max = probs[0];
-        for (int i = 1; i < probs.length; i++) if (probs[i] > max) { max = probs[i]; best = i; }
+        int second = -1; float secondMax = -Float.MAX_VALUE;
+        for (int i = 1; i < probs.length; i++) {
+            float v = probs[i];
+            if (v > max) {
+                secondMax = max; second = best;
+                max = v; best = i;
+            } else if (v > secondMax) {
+                secondMax = v; second = i;
+            }
+        }
+        if (secondMax < 0f) secondMax = 0f;
+        float margin = max - secondMax;
+
+        boolean pass = (max >= rejectThreshold) && (margin >= rejectMargin);
+        if (!pass) return new Result(-1, max);
         return new Result(best, Math.max(0f, max));
     }
 
     private float[][] runSingle(Interpreter it, float[][][][] input) {
-        float[][] out = new float[1][Math.max(labels.length, 3)];
+        int n = getNumOutputClasses(it);
+        float[][] out = new float[1][n];
         it.run(input, out);
         return out;
     }
 
     private float[][] runFused(Interpreter it, float[][][][] inColor, float[][][][] inTex) {
-        float[][] out = new float[1][Math.max(labels.length, 3)];
+        int n = getNumOutputClasses(it);
+        float[][] out = new float[1][n];
         Object[] inputs = new Object[]{ inColor, inTex };
         Map<Integer,Object> outputs = new HashMap<>();
         outputs.put(0, out);
@@ -668,8 +729,44 @@ public class KlasifikasiActivity extends AppCompatActivity {
        Preprocess
        =============================== */
     private Bitmap loadBitmap(Uri uri, int w, int h) throws IOException {
-        Bitmap src = android.provider.MediaStore.Images.Media.getBitmap(getContentResolver(), uri);
+        Bitmap src;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            android.graphics.ImageDecoder.Source source =
+                    android.graphics.ImageDecoder.createSource(getContentResolver(), uri);
+            src = android.graphics.ImageDecoder.decodeBitmap(source, (decoder, info, s) -> {
+                decoder.setAllocator(android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE);
+            });
+        } else {
+            src = android.provider.MediaStore.Images.Media.getBitmap(getContentResolver(), uri);
+        }
+        if (src.getWidth() == w && src.getHeight() == h) return src;
         return Bitmap.createScaledBitmap(src, w, h, true);
+    }
+
+    private File saveBytesToDownloads(String filename, String mime, byte[] data) throws IOException {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            android.content.ContentValues values = new android.content.ContentValues();
+            values.put(android.provider.MediaStore.Downloads.DISPLAY_NAME, filename);
+            values.put(android.provider.MediaStore.Downloads.MIME_TYPE, mime);
+            values.put(android.provider.MediaStore.Downloads.IS_PENDING, 1);
+            android.net.Uri uri = getContentResolver().insert(
+                    android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+            if (uri == null) throw new IOException("Gagal insert MediaStore");
+            try (OutputStream os = getContentResolver().openOutputStream(uri)) {
+                if (os == null) throw new IOException("openOutputStream null");
+                os.write(data);
+            }
+            values.clear();
+            values.put(android.provider.MediaStore.Downloads.IS_PENDING, 0);
+            getContentResolver().update(uri, values, null, null);
+            return new File("/sdcard/Download/" + filename); // indikatif (bisa beda vendor)
+        } else {
+            File base = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+            if (!base.exists() && !base.mkdirs()) throw new IOException("Gagal buat Downloads");
+            File out = new File(base, filename);
+            try (FileOutputStream fos = new FileOutputStream(out)) { fos.write(data); }
+            return out;
+        }
     }
 
     private Bitmap toColorOnly(Bitmap b) {
@@ -798,7 +895,7 @@ public class KlasifikasiActivity extends AppCompatActivity {
         root.setPadding(pad, pad, pad, pad);
 
         android.widget.TextView t1 = new android.widget.TextView(this);
-        TextViewCompat.setTextAppearance(t1, com.google.android.material.R.style.TextAppearance_Material3_TitleMedium);
+        t1.setTypeface(Typeface.DEFAULT_BOLD);
         t1.setText("Langkah Gambar");
         root.addView(t1);
 
@@ -828,7 +925,6 @@ public class KlasifikasiActivity extends AppCompatActivity {
         btnExport.setText("Ekspor CSV (R,G,B & Tekstur)");
         btnExport.setOnClickListener(v -> {
             try {
-                // Folder publik: Downloads/Ekspor Hasil
                 File base;
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     base = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
@@ -838,20 +934,15 @@ public class KlasifikasiActivity extends AppCompatActivity {
                 File dir = new File(base, "Ekspor Hasil");
                 if (!dir.exists() && !dir.mkdirs()) throw new IOException("Gagal membuat folder: " + dir.getAbsolutePath());
 
-                File fR = new File(dir, "tensor_R.csv");
-                File fG = new File(dir, "tensor_G.csv");
-                File fB = new File(dir, "tensor_B.csv");
-                File fT = new File(dir, "texture.csv");
-
-                writeCsv2D(R, fR);
-                writeCsv2D(G, fG);
-                writeCsv2D(B, fB);
-
-                int[][] T = bitmapToGray2D(lastTextureBmp);
-                writeCsv2D(T, fT);
+                File fR = writeCsv2D(tensorChannelToInt2D(lastInColor, 0), "tensor_R.csv");
+                File fG = writeCsv2D(tensorChannelToInt2D(lastInColor, 1), "tensor_G.csv");
+                File fB = writeCsv2D(tensorChannelToInt2D(lastInColor, 2), "tensor_B.csv");
+                File fT = writeCsv2D(bitmapToGray2D(lastTextureBmp),       "texture.csv");
 
                 Toast.makeText(this,
-                        "Tersimpan di:\n"+dir.getAbsolutePath(),
+                        "Tersimpan di Downloads:\n"
+                                + fR.getName() + ", " + fG.getName() + ", "
+                                + fB.getName() + ", " + fT.getName(),
                         Toast.LENGTH_LONG).show();
             } catch (Exception e) {
                 Toast.makeText(this, "Gagal ekspor: "+e.getMessage(), Toast.LENGTH_LONG).show();
@@ -944,16 +1035,16 @@ public class KlasifikasiActivity extends AppCompatActivity {
         return sb.toString();
     }
 
-    private void writeCsv2D(int[][] m, File f) throws IOException {
-        try (java.io.BufferedWriter w = new java.io.BufferedWriter(new java.io.FileWriter(f))) {
-            for (int y=0;y<m.length;y++){
-                for (int x=0;x<m[0].length;x++){
-                    if (x>0) w.write(',');
-                    w.write(Integer.toString(m[y][x]));
-                }
-                w.write('\n');
+    private File writeCsv2D(int[][] m, String filename) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        for (int y=0;y<m.length;y++){
+            for (int x=0;x<m[0].length;x++){
+                if (x>0) sb.append(',');
+                sb.append(m[y][x]);
             }
+            sb.append('\n');
         }
+        return saveBytesToDownloads(filename, "text/csv", sb.toString().getBytes("UTF-8"));
     }
 
     /** Ubah grayscale → heatmap warna (untuk visualisasi tekstur) */
@@ -981,7 +1072,6 @@ public class KlasifikasiActivity extends AppCompatActivity {
     private void saveHasilToServer(String idUser, Uri imageUri,
                                    String warna, String tekstur, String gabungan) {
         try {
-            // format waktu sekarang: 2025-01-01 08:00:00
             String now = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
                     .format(new Date());
 
@@ -997,21 +1087,18 @@ public class KlasifikasiActivity extends AppCompatActivity {
             conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
 
             try (DataOutputStream os = new DataOutputStream(conn.getOutputStream())) {
-                // field text
                 writeFormField(os, boundary, "id_user",  (idUser == null || idUser.isEmpty()) ? "0" : idUser);
                 writeFormField(os, boundary, "warna",    (warna == null)    ? "-" : warna);
                 writeFormField(os, boundary, "tekstur",  (tekstur == null)  ? "-" : tekstur);
                 writeFormField(os, boundary, "gabungan", (gabungan == null) ? "-" : gabungan);
-                writeFormField(os, boundary, "tanggal",  now); // ✅ kirim jam sekarang
+                writeFormField(os, boundary, "tanggal",  now);
 
-                // field file
                 InputStream is = getContentResolver().openInputStream(imageUri);
-                byte[] img = readBytes(is); // helper di file ini
+                byte[] img = readBytes(is);
                 String mime = getContentResolver().getType(imageUri);
                 if (mime == null || mime.trim().isEmpty()) mime = "image/jpeg";
                 writeFileField(os, boundary, "image", "input.jpg", mime, img);
 
-                // tutup multipart
                 os.writeBytes("--" + boundary + "--\r\n");
                 os.flush();
             }
@@ -1050,5 +1137,13 @@ public class KlasifikasiActivity extends AppCompatActivity {
         os.writeBytes("Content-Type: " + mime + "\r\n\r\n");
         os.write(data);
         os.writeBytes("\r\n");
+    }
+
+    private int getNumOutputClasses(Interpreter it) {
+        try {
+            int[] shape = it.getOutputTensor(0).shape(); // contoh: [1, N]
+            if (shape.length > 0) return shape[shape.length - 1];
+        } catch (Exception ignored) {}
+        return Math.max(labels != null ? labels.length : 0, 1); // fallback
     }
 }
